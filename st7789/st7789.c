@@ -50,6 +50,7 @@
 #include "st7789.h"
 #include "jpg/tjpgd565.h"
 #include "png/pngle.h"
+#include "rlv/rlv.h"
 
 #define _swap_int16_t(a, b) { int16_t t = a; a = b; b = t; }
 #define _swap_bytes(val) ((((val) >> 8) & 0x00FF) | (((val) << 8) & 0xFF00))
@@ -2009,6 +2010,351 @@ static mp_obj_t st7789_ST7789_png(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_png_obj, 4, 5, st7789_ST7789_png);
 
 //
+// RLV Video Playback Functions
+//
+
+typedef struct _RLV_USER_DATA {
+    st7789_ST7789_obj_t *self;
+    int ofs_x;
+    int ofs_y;
+    uint16_t fg_color;
+    uint16_t bg_color;
+} RLV_USER_DATA;
+
+typedef struct _RLV_DECODE_USER_DATA {
+    uint16_t *frame_buffer;
+    uint16_t width;
+    uint16_t height;
+} RLV_DECODE_USER_DATA;
+
+void rlv_pixel_draw(rlv_decoder_t *decoder, uint16_t x, uint16_t y, uint8_t color) {
+    RLV_USER_DATA *user_data = (RLV_USER_DATA *)rlv_decoder_get_user_data(decoder);
+    st7789_ST7789_obj_t *self = user_data->self;
+    
+    int draw_x = x + user_data->ofs_x;
+    int draw_y = y + user_data->ofs_y;
+    
+    if (draw_x >= 0 && draw_y >= 0 && draw_x < self->width && draw_y < self->height) {
+        uint16_t pixel_color = color ? user_data->fg_color : user_data->bg_color;
+        draw_pixel(self, draw_x, draw_y, pixel_color);
+    }
+}
+
+// 行缓冲渲染回调函数
+void rlv_line_render(rlv_decoder_t *decoder, uint16_t y, uint16_t *line_buffer, uint16_t width) {
+    RLV_USER_DATA *user_data = (RLV_USER_DATA *)rlv_decoder_get_user_data(decoder);
+    st7789_ST7789_obj_t *self = user_data->self;
+    
+    int draw_y = y + user_data->ofs_y;
+    int draw_x = user_data->ofs_x;
+    
+    if (draw_y >= 0 && draw_y < self->height && draw_x >= 0 && draw_x + width <= self->width) {
+        set_window(self, draw_x, draw_y, draw_x + width - 1, draw_y);
+        DC_HIGH();
+        CS_LOW();
+        write_spi(self->spi_obj, (uint8_t*)line_buffer, width * 2);
+        CS_HIGH();
+    }
+}
+
+// 帧解码的行缓冲回调函数
+void rlv_decode_line_render(rlv_decoder_t *decoder, uint16_t y, uint16_t *line_buffer, uint16_t width) {
+    RLV_DECODE_USER_DATA *user_data = (RLV_DECODE_USER_DATA *)rlv_decoder_get_user_data(decoder);
+    
+    if (y < user_data->height && user_data->frame_buffer) {
+        uint16_t copy_width = (width > user_data->width) ? user_data->width : width;
+        memcpy(user_data->frame_buffer + y * user_data->width, line_buffer, copy_width * 2);
+    }
+}
+
+static mp_obj_t st7789_ST7789_rlv_play(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum {
+        ARG_fg_color,
+        ARG_bg_color,
+        ARG_loop_count,
+        ARG_cache_size,
+        ARG_fps_print
+    };
+    
+    static const mp_arg_t allowed_args[] = {
+        {MP_QSTR_fg_color, MP_ARG_INT, {.u_int = WHITE}},
+        {MP_QSTR_bg_color, MP_ARG_INT, {.u_int = BLACK}},
+        {MP_QSTR_loop_count, MP_ARG_INT, {.u_int = 1}},
+        {MP_QSTR_cache_size, MP_ARG_INT, {.u_int = 1024}},
+        {MP_QSTR_fps_print, MP_ARG_BOOL, {.u_bool = false}}
+    };
+    
+    // 检查最少参数数量 (self, rlv_data, x, y)
+    if (n_args < 4) {
+        mp_raise_TypeError(MP_ERROR_TEXT("rlv_play() missing required positional arguments"));
+    }
+    
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 4, pos_args + 4, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+    
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    
+    mp_buffer_info_t bufinfo;
+    mp_file_t *fp = NULL;
+    bool is_file = false;
+    
+    if (mp_obj_is_type(pos_args[1], &mp_type_bytes)) {
+        mp_get_buffer_raise(pos_args[1], &bufinfo, MP_BUFFER_READ);
+    } else {
+        const char *filename = mp_obj_str_get_str(pos_args[1]);
+        fp = mp_open(filename, "rb");
+        if (!fp) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to open RLV file"));
+        }
+        is_file = true;
+    }
+    
+    mp_int_t x = mp_obj_get_int(pos_args[2]);
+    mp_int_t y = mp_obj_get_int(pos_args[3]);
+    mp_int_t fg_color = _swap_bytes(args[ARG_fg_color].u_int);
+    mp_int_t bg_color = _swap_bytes(args[ARG_bg_color].u_int);
+    mp_int_t loop_count = args[ARG_loop_count].u_int;
+    mp_int_t cache_size = args[ARG_cache_size].u_int;
+    bool fps_print = args[ARG_fps_print].u_bool;
+    
+    rlv_decoder_t *decoder = rlv_decoder_new_with_cache_size(cache_size);
+    if (!decoder) {
+        if (is_file) {
+            mp_close(fp);
+        }
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to create RLV decoder"));
+    }
+    
+    // 设置FPS打印
+    rlv_decoder_set_fps_print(decoder, fps_print);
+    
+    int init_result;
+    if (is_file) {
+        init_result = rlv_decoder_init_file(decoder, fp);
+    } else {
+        init_result = rlv_decoder_init(decoder, bufinfo.buf, bufinfo.len);
+    }
+    
+    if (init_result != 0) {
+        rlv_decoder_destroy(decoder);
+        if (is_file) {
+            mp_close(fp);
+        }
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to initialize RLV decoder"));
+    }
+    
+    RLV_USER_DATA user_data = {
+        .self = self,
+        .ofs_x = x,
+        .ofs_y = y,
+        .fg_color = fg_color,
+        .bg_color = bg_color
+    };
+    
+    rlv_decoder_set_user_data(decoder, &user_data);
+    
+    uint32_t target_frame_time = (1000 * 1000) / decoder->header.fps; // 微秒为单位的目标帧时间
+    uint32_t loop_start_time = get_ticks_ms() * 1000; // 转换为微秒
+    
+    for (int loop = 0; loop < loop_count; loop++) {
+        for (uint16_t frame = 0; frame < decoder->header.frame_count; frame++) {
+            uint32_t frame_start_time = get_ticks_ms() * 1000; // 微秒
+            
+            if (rlv_decoder_decode_frame_line_by_line(decoder, frame, rlv_line_render, fg_color, bg_color) != 0) {
+                break;
+            }
+            
+            // 计算帧处理时间
+            uint32_t frame_end_time = get_ticks_ms() * 1000; // 微秒
+            uint32_t frame_process_time = frame_end_time - frame_start_time;
+            
+            // 计算需要延迟的时间
+            if (target_frame_time > frame_process_time) {
+                uint32_t delay_us = target_frame_time - frame_process_time;
+                uint32_t delay_ms = delay_us / 1000;
+                if (delay_ms > 0) {
+                    mp_hal_delay_ms(delay_ms);
+                }
+                // 对于小于1ms的延迟，使用微秒延迟（如果平台支持）
+                uint32_t remaining_us = delay_us % 1000;
+                if (remaining_us > 0) {
+                    mp_hal_delay_us(remaining_us);
+                }
+            }
+        }
+    }
+    
+    rlv_decoder_destroy(decoder);
+    if (is_file) {
+        mp_close(fp);
+    }
+    
+    return mp_const_none;
+}
+
+static mp_obj_t st7789_ST7789_rlv_decode_frame(size_t n_args, const mp_obj_t *args) {
+    st7789_ST7789_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    
+    mp_buffer_info_t bufinfo;
+    if (mp_obj_is_type(args[1], &mp_type_bytes)) {
+        mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+    } else {
+        const char *filename = mp_obj_str_get_str(args[1]);
+        self->fp = mp_open(filename, "rb");
+        if (!self->fp) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to open RLV file"));
+        }
+        
+        mp_seek(self->fp, 0, SEEK_END);
+        size_t file_size = mp_tell(self->fp);
+        mp_seek(self->fp, 0, SEEK_SET);
+        
+        uint8_t *file_data = m_malloc(file_size);
+        if (!file_data) {
+            mp_close(self->fp);
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Out of memory"));
+        }
+        
+        mp_readinto(self->fp, file_data, file_size);
+        mp_close(self->fp);
+        
+        bufinfo.buf = file_data;
+        bufinfo.len = file_size;
+    }
+    
+    mp_int_t frame_index = mp_obj_get_int(args[2]);
+    mp_int_t fg_color = (n_args > 3) ? _swap_bytes(mp_obj_get_int(args[3])) : _swap_bytes(WHITE);
+    mp_int_t bg_color = (n_args > 4) ? _swap_bytes(mp_obj_get_int(args[4])) : _swap_bytes(BLACK);
+    
+    rlv_decoder_t *decoder = rlv_decoder_new();
+    if (!decoder) {
+        if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+            m_free(bufinfo.buf);
+        }
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to create RLV decoder"));
+    }
+    
+    if (rlv_decoder_init(decoder, bufinfo.buf, bufinfo.len) != 0) {
+        rlv_decoder_destroy(decoder);
+        if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+            m_free(bufinfo.buf);
+        }
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to initialize RLV decoder"));
+    }
+    
+    if (frame_index >= decoder->header.frame_count) {
+        rlv_decoder_destroy(decoder);
+        if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+            m_free(bufinfo.buf);
+        }
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Frame index out of range"));
+    }
+    
+    size_t frame_size = decoder->header.width * decoder->header.height * 2;
+    uint16_t *frame_buffer = m_malloc(frame_size);
+    if (!frame_buffer) {
+        rlv_decoder_destroy(decoder);
+        if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+            m_free(bufinfo.buf);
+        }
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Out of memory for frame buffer"));
+    }
+    
+    // 使用流式解码而不是完整帧缓冲区解码
+    RLV_DECODE_USER_DATA decode_user_data = {
+        .frame_buffer = frame_buffer,
+        .width = decoder->header.width,
+        .height = decoder->header.height
+    };
+    
+    rlv_decoder_set_user_data(decoder, &decode_user_data);
+    
+    if (rlv_decoder_decode_frame_line_by_line(decoder, frame_index, rlv_decode_line_render, fg_color, bg_color) != 0) {
+        m_free(frame_buffer);
+        rlv_decoder_destroy(decoder);
+        if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+            m_free(bufinfo.buf);
+        }
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to decode frame"));
+    }
+    
+    mp_obj_t result[3] = {
+        mp_obj_new_bytearray(frame_size, (mp_obj_t *)frame_buffer),
+        mp_obj_new_int(decoder->header.width),
+        mp_obj_new_int(decoder->header.height)
+    };
+    
+    rlv_decoder_destroy(decoder);
+    if (!mp_obj_is_type(args[1], &mp_type_bytes)) {
+        m_free(bufinfo.buf);
+    }
+    
+    return mp_obj_new_tuple(3, result);
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_KW(st7789_ST7789_rlv_play_obj, 3, st7789_ST7789_rlv_play);
+
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(st7789_ST7789_rlv_decode_frame_obj, 3, 5, st7789_ST7789_rlv_decode_frame);
+
+static mp_obj_t st7789_ST7789_rlv_info(mp_obj_t self_in, mp_obj_t rlv_data) {
+    mp_buffer_info_t bufinfo;
+    mp_file_t *fp = NULL;
+    bool is_file = false;
+    
+    if (mp_obj_is_type(rlv_data, &mp_type_bytes)) {
+        mp_get_buffer_raise(rlv_data, &bufinfo, MP_BUFFER_READ);
+    } else {
+        const char *filename = mp_obj_str_get_str(rlv_data);
+        fp = mp_open(filename, "rb");
+        if (!fp) {
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to open RLV file"));
+        }
+        is_file = true;
+    }
+    
+    rlv_decoder_t *decoder = rlv_decoder_new();
+    if (!decoder) {
+        if (is_file) {
+            mp_close(fp);
+        }
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to create RLV decoder"));
+    }
+    
+    int init_result;
+    if (is_file) {
+        init_result = rlv_decoder_init_file(decoder, fp);
+    } else {
+        init_result = rlv_decoder_init(decoder, bufinfo.buf, bufinfo.len);
+    }
+    
+    if (init_result != 0) {
+        rlv_decoder_destroy(decoder);
+        if (is_file) {
+            mp_close(fp);
+        }
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to initialize RLV decoder"));
+    }
+    
+    mp_obj_t info_dict = mp_obj_new_dict(6);
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_width), mp_obj_new_int(decoder->header.width));
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_height), mp_obj_new_int(decoder->header.height));
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_fps), mp_obj_new_int(decoder->header.fps));
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_frame_count), mp_obj_new_int(decoder->header.frame_count));
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_frame_table_bits), mp_obj_new_int(decoder->header.frame_table_bits));
+    mp_obj_dict_store(info_dict, MP_OBJ_NEW_QSTR(MP_QSTR_unit_bits), mp_obj_new_int(decoder->header.unit_bits));
+    
+    rlv_decoder_destroy(decoder);
+    if (is_file) {
+        mp_close(fp);
+    }
+    
+    return info_dict;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_2(st7789_ST7789_rlv_info_obj, st7789_ST7789_rlv_info);
+
+//
 // Return the center of a polygon as an (x, y) tuple
 //
 
@@ -2380,6 +2726,9 @@ static const mp_rom_map_elem_t st7789_ST7789_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_jpg), MP_ROM_PTR(&st7789_ST7789_jpg_obj)},
     {MP_ROM_QSTR(MP_QSTR_jpg_decode), MP_ROM_PTR(&st7789_ST7789_jpg_decode_obj)},
     {MP_ROM_QSTR(MP_QSTR_png), MP_ROM_PTR(&st7789_ST7789_png_obj)},
+    {MP_ROM_QSTR(MP_QSTR_rlv_play), MP_ROM_PTR(&st7789_ST7789_rlv_play_obj)},
+    {MP_ROM_QSTR(MP_QSTR_rlv_decode_frame), MP_ROM_PTR(&st7789_ST7789_rlv_decode_frame_obj)},
+    {MP_ROM_QSTR(MP_QSTR_rlv_info), MP_ROM_PTR(&st7789_ST7789_rlv_info_obj)},
     {MP_ROM_QSTR(MP_QSTR_polygon_center), MP_ROM_PTR(&st7789_ST7789_polygon_center_obj)},
     {MP_ROM_QSTR(MP_QSTR_polygon), MP_ROM_PTR(&st7789_ST7789_polygon_obj)},
     {MP_ROM_QSTR(MP_QSTR_fill_polygon), MP_ROM_PTR(&st7789_ST7789_fill_polygon_obj)},
