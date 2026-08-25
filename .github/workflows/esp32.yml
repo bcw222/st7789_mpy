@@ -10,6 +10,7 @@ jobs:
       MICROPYTHON_VERSION: v1.25.0
       BUILD_VERBOSE: 1
     strategy:
+      fail-fast: false
       matrix:
         include:
           - idf_target: esp32
